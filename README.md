@@ -1,4 +1,4 @@
-<img width="25%" height="25%" align="right" alt="image" src="https://github.com/user-attachments/assets/6fa1ccab-6974-4186-9e89-b52530085d47" />
+<img width="15%" height="15%" align="right" alt="image" src="https://github.com/user-attachments/assets/6fa1ccab-6974-4186-9e89-b52530085d47" />
 
 # Bluetooth OBDX J2534
 

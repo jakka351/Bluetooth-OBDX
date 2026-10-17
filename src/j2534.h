@@ -160,7 +160,8 @@
 // J2534-2 config parameters
 // J1962_PINS value: (pinA << 8) | pinB. 0x060E = HS-CAN pins 6/14,
 // 0x030B = MS-CAN pins 3/11 (Ford), 0x0000 = default for the protocol.
-#define J1962_PINS          0x8037
+#define CAN_MIXED_FORMAT    0x8000
+#define J1962_PINS          0x8001
 
 // -------------------------------------------------------------------------
 // Structures

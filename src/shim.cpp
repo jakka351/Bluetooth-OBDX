@@ -1,18 +1,20 @@
 //
 // shim.cpp - BlueJ2534: SAE J2534-1 v04.04 PassThru shim that talks to an
-// OBDX Pro FT over Bluetooth SPP (RFCOMM) instead of USB, using the ELM AT
-// command set plus the OBDX extended DX command set.
+// OBDX Pro FT over Bluetooth SPP (RFCOMM) using the OBDX DVI binary protocol.
 //
-// Proof of concept targeting the OBDX Pro FT:
-//   - CAN / ISO15765 first-class: TX via "DXSD <4-byte ID> <data>" (header
-//     inline, no ATSH juggling), ISO-TP segmentation/flow-control handled by
-//     the tool (ATCAF1 + ATFCSH/ATFCSD/ATFCSM1 from the J2534 FC filter).
-//   - DXPT1 passthrough mode streams received frames at any time, so a
-//     background pump feeds PassThruReadMsgs asynchronously (no "send 1,
-//     receive 1" ELM limitation).
-//   - J1850 VPW supported (ATSP2); 125 kbaud CAN maps to MS-CAN (ATSPE,
-//     Ford pins 3/11). No K-line on the FT, so ISO9141/ISO14230 are refused.
-//   - PassThruSetProgrammingVoltage drives the Ford FEPS pin via DXFEPS1/0.
+// Why DVI (not ELM text): the OBDX shares one serial link for bus frames and
+// command responses. In ELM string mode they collide on a busy bus - an "OK"
+// is lost among streamed frames or merged onto one. DVI frames every message
+// with a length and checksum, so unsolicited bus frames (0x08/0x09) and
+// command acks (0x20/0x41/0x44) are always cleanly separable. Comms stays
+// enabled while we send; no stop/resume stream dance is needed.
+//
+// The OBDX Pro FT is CAN-only (HS-CAN, MS-CAN, ISO15765 - no K-line, no VPW;
+// the official FT J2534 entry declares J1850VPW=0).
+//
+// Locking: g_dev.lock serializes ALL adapter I/O (transact + poll) and all
+// shared channel state. g_chan.rxLock guards only the RX queue. Order:
+// g_dev.lock then rxLock.
 //
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -24,15 +26,16 @@
 
 #include "j2534.h"
 #include "transport.h"
-#include "elm327.h"
+#include "dvi.h"
 #include "log.h"
 
 // =========================================================================
 // Globals / configuration
 // =========================================================================
 
-static HINSTANCE g_hInst = NULL;
 static char g_dllDir[MAX_PATH] = {0};
+static HINSTANCE g_hInst = NULL;
+static bool g_modulePinned = false;
 
 struct Config {
     std::string mode;      // "bt" or "com"
@@ -43,17 +46,24 @@ struct Config {
     bool log;
 };
 static Config g_cfg;
+static bool g_cfgLoaded = false;
 
+static SRWLOCK g_errLock = SRWLOCK_INIT;
 static char g_lastError[256] = "No error";
 
 static void setLastError(const char* fmt, ...)
 {
+    char buf[256];
     va_list args;
     va_start(args, fmt);
-    _vsnprintf(g_lastError, sizeof(g_lastError) - 1, fmt, args);
+    _vsnprintf(buf, sizeof(buf) - 1, fmt, args);
     va_end(args);
-    g_lastError[sizeof(g_lastError) - 1] = 0;
-    Log("ERROR: %s", g_lastError);
+    buf[sizeof(buf) - 1] = 0;
+
+    AcquireSRWLockExclusive(&g_errLock);
+    strcpy(g_lastError, buf);
+    ReleaseSRWLockExclusive(&g_errLock);
+    Log("ERROR: %s", buf);
 }
 
 static void loadConfig()
@@ -67,7 +77,7 @@ static void loadConfig()
     g_cfg.mode = buf;
     GetPrivateProfileStringA("connection", "BtAddress", "", buf, sizeof(buf), ini);
     g_cfg.btAddress = buf;
-    GetPrivateProfileStringA("connection", "BtName", "OBDII", buf, sizeof(buf), ini);
+    GetPrivateProfileStringA("connection", "BtName", "OBDX", buf, sizeof(buf), ini);
     g_cfg.btName = buf;
     GetPrivateProfileStringA("connection", "ComPort", "COM5", buf, sizeof(buf), ini);
     g_cfg.comPort = buf;
@@ -82,36 +92,14 @@ static unsigned long nowMicros()
         QueryPerformanceFrequency(&freq);
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    return (unsigned long)((c.QuadPart * 1000000) / freq.QuadPart);
+    LONGLONG secs = c.QuadPart / freq.QuadPart;
+    LONGLONG rem  = c.QuadPart % freq.QuadPart;
+    return (unsigned long)(secs * 1000000 + (rem * 1000000) / freq.QuadPart);
 }
 
-// =========================================================================
-// Hex helpers
-// =========================================================================
-
-static bool isHexDigit(char c)
+static unsigned long clampTimeout(unsigned long ms)
 {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
-}
-
-static int hexVal(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
-static std::string toHex(const unsigned char* data, unsigned long len)
-{
-    static const char* digits = "0123456789ABCDEF";
-    std::string s;
-    s.reserve(len * 2);
-    for (unsigned long i = 0; i < len; i++) {
-        s += digits[data[i] >> 4];
-        s += digits[data[i] & 0xF];
-    }
-    return s;
+    return ms > 0x7FFFFFF0ul ? 0x7FFFFFF0ul : ms;
 }
 
 // =========================================================================
@@ -120,11 +108,10 @@ static std::string toHex(const unsigned char* data, unsigned long len)
 
 struct Filter {
     bool          used;
-    unsigned long type;            // PASS_FILTER / BLOCK_FILTER / FLOW_CONTROL_FILTER
+    unsigned long type;            // PASS / BLOCK / FLOW_CONTROL
     unsigned long maskId;
     unsigned long patternId;
     unsigned long flowControlId;   // tester TX id (FLOW_CONTROL only)
-    unsigned long flags;
 };
 
 struct PeriodicMsg {
@@ -135,7 +122,6 @@ struct PeriodicMsg {
 };
 
 struct IsoTpRx {
-    bool          active;
     unsigned long expectedLen;
     unsigned char nextSeq;
     std::vector<unsigned char> data;
@@ -150,11 +136,12 @@ struct Channel {
     bool          open;
     unsigned long protocol;     // base protocol (CAN_PS -> CAN, etc.)
     unsigned long appProtocol;  // protocol ID the application connected with
-    unsigned long pins;         // J1962_PINS: 0x060E = HS-CAN, 0x030B = MS-CAN
+    unsigned long pins;         // J1962_PINS: 0x060E HS-CAN, 0x030B MS-CAN
+    bool          pinsExplicit; // app set J1962_PINS itself
     unsigned long flags;
     unsigned long baud;
     unsigned long loopback;
-    unsigned long bs, stmin;       // our FC parameters (advertised via ATFCSD)
+    unsigned long bs, stmin;    // flow-control block size / STmin
 
     Filter        filters[MAX_FILTERS];
     PeriodicMsg   periodic[MAX_PERIODIC];
@@ -162,40 +149,25 @@ struct Channel {
     std::deque<PASSTHRU_MSG> rxQueue;
     CRITICAL_SECTION          rxLock;
     HANDLE                    rxEvent;
+    bool                      rxOverflowed;
 
     std::map<unsigned long, IsoTpRx> isotp;
-
-    // ELM programming cache - avoid resending AT commands needlessly
-    long          curTxHeader;     // -1 = unknown
-    long          curRxAddr;       // ATCRA, -1 = none
-    long          curFcHeader;     // ATFCSH, -1 = none
 };
 
 struct Device {
     bool             open;
-    Elm327           elm;
-    CRITICAL_SECTION lock;          // serializes all ELM transactions
-    HANDLE           periodicThread;
-    HANDLE           periodicStop;
+    Dvi              dvi;
+    CRITICAL_SECTION lock;
+    HANDLE           workerThread;
+    HANDLE           workerStop;
 };
 
 static Device  g_dev;
 static Channel g_chan;
-static bool    g_initDone = false;
+static bool    g_syncInit = false;
 
 #define DEVICE_ID   1
 #define CHANNEL_ID  1
-
-static void ensureInit()
-{
-    if (!g_initDone) {
-        InitializeCriticalSection(&g_dev.lock);
-        InitializeCriticalSection(&g_chan.rxLock);
-        g_chan.rxEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-        g_dev.periodicStop = CreateEventA(NULL, TRUE, FALSE, NULL);
-        g_initDone = true;
-    }
-}
 
 // =========================================================================
 // RX queue
@@ -204,8 +176,16 @@ static void ensureInit()
 static void enqueueMsg(const PASSTHRU_MSG& m)
 {
     EnterCriticalSection(&g_chan.rxLock);
-    if (g_chan.rxQueue.size() < RX_QUEUE_MAX)
-        g_chan.rxQueue.push_back(m);
+    if (g_chan.rxQueue.size() >= RX_QUEUE_MAX) {
+        g_chan.rxQueue.pop_front();
+        if (!g_chan.rxOverflowed) {
+            g_chan.rxOverflowed = true;
+            Log("RX queue overflow - dropping oldest messages");
+        }
+    } else if (g_chan.rxQueue.size() < RX_QUEUE_MAX / 2) {
+        g_chan.rxOverflowed = false;
+    }
+    g_chan.rxQueue.push_back(m);
     LeaveCriticalSection(&g_chan.rxLock);
     SetEvent(g_chan.rxEvent);
 }
@@ -232,51 +212,7 @@ static void makeMsg(PASSTHRU_MSG& m, unsigned long protocol, unsigned long rxSta
 }
 
 // =========================================================================
-// Filters
-// =========================================================================
-
-// Returns true if a frame/message with this CAN id should be delivered.
-static bool filterAccept(unsigned long id)
-{
-    bool anyPass = false;
-    for (int i = 0; i < MAX_FILTERS; i++) {
-        const Filter& f = g_chan.filters[i];
-        if (!f.used)
-            continue;
-        if (f.type == BLOCK_FILTER) {
-            if ((id & f.maskId) == (f.patternId & f.maskId))
-                return false;
-        } else { // PASS or FLOW_CONTROL
-            anyPass = true;
-        }
-    }
-    if (!anyPass)
-        return true;    // lenient POC: nothing configured -> pass everything
-
-    for (int i = 0; i < MAX_FILTERS; i++) {
-        const Filter& f = g_chan.filters[i];
-        if (!f.used || f.type == BLOCK_FILTER)
-            continue;
-        if ((id & f.maskId) == (f.patternId & f.maskId))
-            return true;
-    }
-    return false;
-}
-
-// Find the flow-control filter matching an RX id -> our TX id for FC frames.
-static Filter* findFlowFilterByRx(unsigned long rxId)
-{
-    for (int i = 0; i < MAX_FILTERS; i++) {
-        Filter& f = g_chan.filters[i];
-        if (f.used && f.type == FLOW_CONTROL_FILTER &&
-            (rxId & f.maskId) == (f.patternId & f.maskId))
-            return &f;
-    }
-    return NULL;
-}
-
-// =========================================================================
-// ELM programming helpers (call with device lock held)
+// Filters (device lock held)
 // =========================================================================
 
 static bool is29Bit()
@@ -284,225 +220,64 @@ static bool is29Bit()
     return (g_chan.flags & CAN_29BIT_ID) != 0;
 }
 
-static bool elmSetRxAddr(unsigned long id)
+// J2534: nothing is received until a PASS or FLOW_CONTROL filter matches;
+// BLOCK filters carve exceptions. The DVI hardware filters mirror this, but
+// we also enforce it in software (zero filters => receive nothing).
+static bool filterAcceptCan(unsigned long id)
 {
-    if (g_chan.curRxAddr == (long)id)
-        return true;
-    char cmd[48];
-    if (is29Bit())
-        _snprintf(cmd, sizeof(cmd), "ATCRA %02lX %02lX %02lX %02lX",
-                  (id >> 24) & 0x1F, (id >> 16) & 0xFF, (id >> 8) & 0xFF, id & 0xFF);
-    else
-        _snprintf(cmd, sizeof(cmd), "ATCRA %03lX", id & 0x7FF);
-    bool ok = g_dev.elm.commandOk(cmd);
-    if (ok)
-        g_chan.curRxAddr = (long)id;
-    return ok;
-}
-
-static void elmClearRxAddr()
-{
-    if (g_chan.curRxAddr == -1)
-        return;
-    g_dev.elm.commandOk("ATCRA");
-    g_chan.curRxAddr = -1;
-}
-
-// Open the hardware filter completely (mask = 0 -> every frame passes);
-// software filters in the shim then decide what the app actually sees.
-static void elmOpenMask()
-{
-    if (is29Bit())
-        g_dev.elm.commandOk("ATCM 00 00 00 00");
-    else
-        g_dev.elm.commandOk("ATCM 000");
-    g_chan.curRxAddr = -1;
-}
-
-// Program the tool to auto-answer First Frames with our Flow Control frame
-// (header = tester ID from the J2534 FC filter, data = 30 BS STmin).
-static bool elmSetFlowControl(unsigned long txId)
-{
-    if (g_chan.curFcHeader == (long)txId)
-        return true;
-    char cmd[48];
-    bool ok;
-    if (is29Bit())
-        _snprintf(cmd, sizeof(cmd), "ATFCSH %02lX %02lX %02lX %02lX",
-                  (txId >> 24) & 0x1F, (txId >> 16) & 0xFF,
-                  (txId >> 8) & 0xFF, txId & 0xFF);
-    else
-        _snprintf(cmd, sizeof(cmd), "ATFCSH %03lX", txId & 0x7FF);
-    ok = g_dev.elm.commandOk(cmd);
-    _snprintf(cmd, sizeof(cmd), "ATFCSD 30 %02lX %02lX",
-              g_chan.bs & 0xFF, g_chan.stmin & 0xFF);
-    ok = g_dev.elm.commandOk(cmd) && ok;
-    ok = g_dev.elm.commandOk("ATFCSM1") && ok;
-    if (ok)
-        g_chan.curFcHeader = (long)txId;
-    return ok;
-}
-
-// Map (base protocol, pins, baud, 29-bit flag) to an OBDX/ELM protocol
-// number. OBDX Pro FT: 2=VPW, 6/7=CAN 500k 11/29bit, 8/9=CAN 250k 11/29bit,
-// B=USER CAN 125k, C=USER CAN 50k, E=MS-CAN 125k (Ford, pins 3/11 - the
-// tool switches the transceiver pins itself on ATSPE).
-// The FT has no K-line, so ISO9141/ISO14230 are rejected.
-static const char* elmProtocolFor(unsigned long protocol, unsigned long pins,
-                                  unsigned long baud, bool f29, std::string& warn)
-{
-    switch (protocol) {
-    case J1850VPW: return "2";
-    case CAN:
-    case ISO15765:
-        if (pins == 0x030B) return "E";    // MS-CAN pins 3/11 (125k fixed)
-        if (baud == 500000) return f29 ? "7" : "6";
-        if (baud == 250000) return f29 ? "9" : "8";
-        if (baud == 125000) return "E";    // MS-CAN by baud rate
-        if (baud == 50000)  return "C";
-        warn = "Unsupported CAN baud rate, defaulting to 500k";
-        return f29 ? "7" : "6";
+    for (int i = 0; i < MAX_FILTERS; i++) {
+        const Filter& f = g_chan.filters[i];
+        if (f.used && f.type == BLOCK_FILTER &&
+            (id & f.maskId) == (f.patternId & f.maskId))
+            return false;
     }
-    return NULL;
-}
-
-// Reprogram the tool for the channel's current bus (protocol number, CAN
-// auto-formatting, filters, flow control, passthrough mode). Used on
-// connect and again on a J1962_PINS bus switch. Device lock held.
-static bool programBus(std::string& err)
-{
-    std::string warn;
-    const char* ep = elmProtocolFor(g_chan.protocol, g_chan.pins, g_chan.baud,
-                                    is29Bit(), warn);
-    if (!ep) {
-        err = "protocol not supported by OBDX Pro FT";
-        return false;
+    for (int i = 0; i < MAX_FILTERS; i++) {
+        const Filter& f = g_chan.filters[i];
+        if (f.used && f.type != BLOCK_FILTER &&
+            (id & f.maskId) == (f.patternId & f.maskId))
+            return true;
     }
-    if (!warn.empty())
-        Log("programBus: %s", warn.c_str());
-
-    if (!g_dev.elm.commandOk(std::string("ATSP") + ep)) {
-        err = "tool rejected ATSP";
-        return false;
-    }
-
-    if (g_chan.protocol == CAN || g_chan.protocol == ISO15765) {
-        // Raw CAN: no auto formatting. ISO15765: tool adds length byte,
-        // segments multi-frame TX and handles flow control (CAF1).
-        g_dev.elm.commandOk(g_chan.protocol == CAN ? "ATCAF0" : "ATCAF1");
-
-        // Changing protocol can reset filter state: start from a fully
-        // open hardware filter, then re-apply any flow-control filter.
-        g_dev.elm.commandOk("ATAR");
-        g_chan.curRxAddr = -1;
-        g_chan.curFcHeader = -1;
-        elmOpenMask();
-        for (int i = 0; i < MAX_FILTERS; i++) {
-            Filter& f = g_chan.filters[i];
-            if (f.used && f.type == FLOW_CONTROL_FILTER) {
-                elmSetRxAddr(f.patternId);
-                elmSetFlowControl(f.flowControlId);
-                break;  // tool has a single FC header slot
-            }
-        }
-    }
-
-    // Passthrough mode: stream received frames at any time.
-    g_dev.elm.commandOk("DXPT1");
-    return true;
+    return false;
 }
 
 // =========================================================================
-// RX parsing: ELM response lines -> frames -> ISO-TP / queue
+// Received-frame routing (device lock held)
 // =========================================================================
 
 struct RawFrame {
     unsigned long id;
-    std::vector<unsigned char> data;    // can exceed 8 bytes: the OBDX
-                                        // delivers assembled ISO-TP messages
-                                        // as a single line in CAF1 mode
+    std::vector<unsigned char> data;
 };
-
-// Parse one response line (headers on) into a CAN frame / assembled message.
-static bool parseCanLine(const std::string& line, RawFrame& f)
-{
-    std::string hex;
-    for (size_t i = 0; i < line.size(); i++) {
-        char c = line[i];
-        if (c == ' ')
-            continue;
-        if (!isHexDigit(c))
-            return false;   // "NO DATA", "CAN ERROR", "SEARCHING...", etc.
-        hex += c;
-    }
-
-    size_t idLen = is29Bit() ? 8 : 3;
-    if (hex.size() < idLen + 2)
-        return false;
-
-    f.id = 0;
-    for (size_t i = 0; i < idLen; i++)
-        f.id = (f.id << 4) | hexVal(hex[i]);
-
-    size_t dataChars = hex.size() - idLen;
-    if (dataChars % 2)
-        dataChars--;        // tolerate a stray trailing nibble
-    size_t len = dataChars / 2;
-    f.data.clear();
-    f.data.reserve(len);
-    for (size_t i = 0; i < len; i++)
-        f.data.push_back((unsigned char)((hexVal(hex[idLen + i*2]) << 4) |
-                                          hexVal(hex[idLen + i*2 + 1])));
-    return !f.data.empty();
-}
 
 static void isotpFeed(const RawFrame& f);
 
-// Digest all lines from an ELM response (frames received from the bus).
-static void processResponse(const std::string& resp)
+// Turn a DVI 0x08/0x09 network frame (data = [id0 id1 id2 id3, payload...])
+// into J2534 messages via the filter + ISO-TP path.
+static void routeNetFrame(const DviMsg& m)
 {
-    std::vector<std::string> lines;
-    Elm327::splitLines(resp, lines);
-    for (size_t i = 0; i < lines.size(); i++) {
-        const std::string& line = lines[i];
-        if (line == "OK" || line == "?" || line.find("SEARCHING") != std::string::npos)
-            continue;
-        if (line.find("NO DATA") != std::string::npos ||
-            line.find("ERROR") != std::string::npos ||
-            line.find("STOPPED") != std::string::npos ||
-            line.find("UNABLE") != std::string::npos ||
-            line.find("BUFFER FULL") != std::string::npos) {
-            Log("ELM status line: %s", line.c_str());
-            continue;
-        }
+    if (!g_chan.open || m.data.size() < 5)
+        return;
+    unsigned long id = ((unsigned long)m.data[0] << 24) | ((unsigned long)m.data[1] << 16) |
+                       ((unsigned long)m.data[2] << 8) | m.data[3];
+    if (!filterAcceptCan(id))
+        return;
 
-        RawFrame f;
-        if (!parseCanLine(line, f)) {
-            Log("Unparsed line: %s", line.c_str());
-            continue;
-        }
+    RawFrame f;
+    f.id = id;
+    f.data.assign(m.data.begin() + 4, m.data.end());
 
-        if (!filterAccept(f.id))
-            continue;
-
-        if (g_chan.protocol == CAN) {
-            size_t n = f.data.size() > 8 ? 8 : f.data.size();
-            PASSTHRU_MSG m;
-            makeMsg(m, g_chan.appProtocol, 0, f.id, f.data.data(), (unsigned long)n, is29Bit());
-            enqueueMsg(m);
-        } else if (g_chan.protocol == ISO15765) {
-            isotpFeed(f);
-        }
+    if (g_chan.protocol == CAN) {
+        size_t n = f.data.size() > 8 ? 8 : f.data.size();
+        PASSTHRU_MSG msg;
+        makeMsg(msg, g_chan.appProtocol, 0, id, f.data.data(), (unsigned long)n, is29Bit());
+        enqueueMsg(msg);
+    } else {
+        isotpFeed(f);
     }
 }
 
-// ISO15765 receive path.
-//
-// With ATCAF1 the OBDX assembles multi-frame responses and delivers them as
-// one line: "7E8 10 0C 11 22 ... CC" (First-Frame PCI retained, full payload
-// follows). Single frames arrive as "7E8 06 41 00 ..." (SF PCI retained).
-// If automatic processing is off (or a generic ELM327 in CAF0 is used), raw
-// FF/CF frames arrive instead, so a manual reassembly fallback is kept.
+// ISO15765 receive. With auto frame processing the tool assembles multi-frame
+// responses; single frames keep their PCI. A raw FF/CF fallback is retained.
 static void isotpFeed(const RawFrame& f)
 {
     size_t n = f.data.size();
@@ -511,54 +286,47 @@ static void isotpFeed(const RawFrame& f)
     const unsigned char* d = f.data.data();
     unsigned char pci = d[0] >> 4;
 
-    IsoTpRx& st = g_chan.isotp[f.id];
-
     switch (pci) {
-    case 0x0: { // Single Frame
+    case 0x0: {
         size_t len = d[0] & 0x0F;
         if (len < 1 || len > n - 1)
             return;
         PASSTHRU_MSG m;
         makeMsg(m, g_chan.appProtocol, 0, f.id, d + 1, (unsigned long)len, is29Bit());
         enqueueMsg(m);
-        st.active = false;
+        g_chan.isotp.erase(f.id);
         break;
     }
-    case 0x1: { // First Frame - assembled message or start of raw reassembly
+    case 0x1: {
         if (n < 2)
             return;
         unsigned long total = ((unsigned long)(d[0] & 0x0F) << 8) | d[1];
         if (total < 8)
             return;
-
-        // FirstFrame indication: 4-byte ID, no data (J2534 04.04).
         PASSTHRU_MSG ind;
         makeMsg(ind, g_chan.appProtocol, ISO15765_FIRST_FRAME, f.id, NULL, 0, is29Bit());
         enqueueMsg(ind);
-
         if (n - 2 >= total) {
-            // Tool already assembled the full message on one line.
             PASSTHRU_MSG m;
             makeMsg(m, g_chan.appProtocol, 0, f.id, d + 2, total, is29Bit());
             enqueueMsg(m);
-            st.active = false;
+            g_chan.isotp.erase(f.id);
         } else {
-            // Raw First Frame (6 payload bytes) - reassemble manually.
+            IsoTpRx& st = g_chan.isotp[f.id];
             st.expectedLen = total;
             st.data.assign(d + 2, d + n);
             st.nextSeq = 1;
-            st.active = true;
             st.lastActivity = GetTickCount();
         }
         break;
     }
-    case 0x2: { // Consecutive Frame (raw reassembly fallback)
-        if (!st.active)
+    case 0x2: {
+        std::map<unsigned long, IsoTpRx>::iterator it = g_chan.isotp.find(f.id);
+        if (it == g_chan.isotp.end())
             return;
+        IsoTpRx& st = it->second;
         if ((d[0] & 0x0F) != (st.nextSeq & 0x0F)) {
-            Log("ISO-TP: sequence error on %03lX (got %X want %X)",
-                f.id, d[0] & 0x0F, st.nextSeq & 0x0F);
-            st.active = false;
+            g_chan.isotp.erase(it);
             return;
         }
         st.nextSeq++;
@@ -569,15 +337,13 @@ static void isotpFeed(const RawFrame& f)
             PASSTHRU_MSG m;
             makeMsg(m, g_chan.appProtocol, 0, f.id, st.data.data(), st.expectedLen, is29Bit());
             enqueueMsg(m);
-            st.active = false;
+            g_chan.isotp.erase(it);
         }
         break;
     }
-    case 0x3:   // Flow Control for our transmissions - the tool handles these
-        break;
+    case 0x3:
+        break;   // flow control for our TX - tool handles it
     default: {
-        // First byte doesn't look like a PCI: the tool delivered the payload
-        // with formatting already stripped - pass it through whole.
         PASSTHRU_MSG m;
         makeMsg(m, g_chan.appProtocol, 0, f.id, d, (unsigned long)n, is29Bit());
         enqueueMsg(m);
@@ -586,19 +352,173 @@ static void isotpFeed(const RawFrame& f)
     }
 }
 
+static void isotpSweepStale()
+{
+    DWORD now = GetTickCount();
+    std::map<unsigned long, IsoTpRx>::iterator it = g_chan.isotp.begin();
+    while (it != g_chan.isotp.end()) {
+        if ((long)(now - it->second.lastActivity) > 1500) {
+            Log("ISO-TP: dropping stalled reassembly on %lX", it->first);
+            g_chan.isotp.erase(it++);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // =========================================================================
-// Transmit (call with device lock held)
+// DVI command helpers (device lock held)
 // =========================================================================
 
-// Build "DXSD 00 00 07 E0 <data...>" - full frame with 4-byte CAN ID inline
-// (OBDX DX Send Data; no ATSH state to manage, no auto-filter side effects).
-static std::string buildDxSd(const PASSTHRU_MSG& msg)
+// Send a DVI command, route any network frames that arrive to the RX queue,
+// and classify the ack. out (optional) receives the response message.
+static long dviCmd(unsigned char cmd, const unsigned char* data, size_t len,
+                   unsigned char wantCmd, DviMsg* out = NULL,
+                   unsigned timeoutMs = 2000, bool large = false)
 {
-    std::string cmd = "DXSD ";
-    cmd += toHex(msg.Data, 4);
-    cmd += toHex(msg.Data + 4, msg.DataSize - 4);
-    return cmd;
+    if (g_dev.dvi.linkDown())
+        return ERR_DEVICE_NOT_CONNECTED;
+
+    std::vector<DviMsg> net;
+    DviMsg resp;
+    bool ok = g_dev.dvi.transact(cmd, data, len, wantCmd, resp, timeoutMs, &net, large);
+    for (size_t i = 0; i < net.size(); i++)
+        routeNetFrame(net[i]);
+    if (!ok)
+        return g_dev.dvi.linkDown() ? ERR_DEVICE_NOT_CONNECTED : ERR_TIMEOUT;
+    if (out)
+        *out = resp;
+    if (resp.cmd == DVI_ERROR) {
+        setLastError("Adapter rejected DVI cmd 0x%02X (err %u)", cmd,
+                     resp.data.size() > 1 ? resp.data[1] : 0);
+        return ERR_FAILED;
+    }
+    return STATUS_NOERROR;
 }
+
+// Map (base protocol, pins, baud) to the DVI protocol byte + baud-rate code.
+// 29-bit vs 11-bit is carried per-filter, so it does not constrain this.
+static bool dviProtocolCodes(unsigned long protocol, unsigned long pins, unsigned long baud,
+                             unsigned char* proto, unsigned char* baudCode, long* err)
+{
+    *err = STATUS_NOERROR;
+    if (protocol != CAN && protocol != ISO15765) {
+        *err = ERR_INVALID_PROTOCOL_ID;
+        return false;
+    }
+    if (pins == 0x030B) {               // MS-CAN pins 3/11 (Ford), 125k fixed
+        *proto = 0x04;
+        *baudCode = 4;
+        return true;
+    }
+    *proto = 0x02;                      // HS-CAN pins 6/14
+    switch (baud) {
+    case 500000: *baudCode = 6; break;
+    case 250000: *baudCode = 5; break;
+    case 125000: *baudCode = 4; break;
+    case 50000:  *baudCode = 1; break;
+    default:     *err = ERR_INVALID_BAUDRATE; return false;
+    }
+    return true;
+}
+
+// Program the DVI hardware filters from g_chan.filters. The FT has >=28
+// hardware filter slots, so each J2534 filter (incl. per-filter flow ID)
+// maps 1:1 - no receive-address contention like the ELM ATCRA path.
+static bool reprogramFilters()
+{
+    bool ok = true;
+    for (int i = 0; i < MAX_FILTERS; i++) {
+        const Filter& f = g_chan.filters[i];
+        unsigned char nn = is29Bit() ? 0x01 : 0x00;
+        if (!f.used) {
+            // Disable slot i (Filter Enable Status sub-command 0x05).
+            unsigned char d[4] = { 0x05, (unsigned char)i, nn, 0x00 };
+            dviCmd(DVI_CAN, d, 4, DVI_CAN_RESP);    // best-effort
+            continue;
+        }
+        unsigned char xx = (f.type == PASS_FILTER)  ? 0x00 :
+                           (f.type == BLOCK_FILTER)  ? 0x02 : 0x01;   // flow=01
+        // Entire filter (sub 0x00): 00 MM NN XX ZZ id[4] mask[4] flow[4]
+        unsigned char d[17];
+        d[0] = 0x00;
+        d[1] = (unsigned char)i;
+        d[2] = nn;
+        d[3] = xx;
+        d[4] = 0x01;                                // enabled
+        d[5]  = (unsigned char)(f.patternId >> 24); d[6]  = (unsigned char)(f.patternId >> 16);
+        d[7]  = (unsigned char)(f.patternId >> 8);  d[8]  = (unsigned char)(f.patternId);
+        d[9]  = (unsigned char)(f.maskId >> 24);    d[10] = (unsigned char)(f.maskId >> 16);
+        d[11] = (unsigned char)(f.maskId >> 8);     d[12] = (unsigned char)(f.maskId);
+        d[13] = (unsigned char)(f.flowControlId >> 24); d[14] = (unsigned char)(f.flowControlId >> 16);
+        d[15] = (unsigned char)(f.flowControlId >> 8);  d[16] = (unsigned char)(f.flowControlId);
+        if (dviCmd(DVI_CAN, d, 17, DVI_CAN_RESP) != STATUS_NOERROR)
+            ok = false;
+    }
+    return ok;
+}
+
+// Push the flow-control block-size / STmin to the tool (DVI FC frame data).
+static void dviSetFcData()
+{
+    unsigned char d[4] = { 0x09, 0x30, (unsigned char)(g_chan.bs & 0xFF),
+                           (unsigned char)(g_chan.stmin & 0xFF) };
+    dviCmd(DVI_CAN, d, 4, DVI_CAN_RESP);
+}
+
+// Enable/disable network communication (00=off, 01=on read+write).
+static long dviSetComms(unsigned char on)
+{
+    unsigned char d[2] = { 0x02, on };
+    return dviCmd(DVI_PROTO, d, 2, DVI_PROTO_RESP);
+}
+
+// Program protocol, baud, formatting, filters and comms for the channel.
+static long programBus()
+{
+    unsigned char proto, baudCode;
+    long errCode;
+    if (!dviProtocolCodes(g_chan.protocol, g_chan.pins, g_chan.baud, &proto, &baudCode, &errCode))
+        return errCode;
+
+    dviSetComms(0x00);                              // quiet while reconfiguring
+
+    unsigned char d[2];
+    d[0] = 0x01; d[1] = proto;                      // set OBD protocol
+    if (dviCmd(DVI_PROTO, d, 2, DVI_PROTO_RESP) != STATUS_NOERROR) {
+        setLastError("Tool rejected set-protocol (0x%02X)", proto);
+        return ERR_FAILED;
+    }
+
+    // Guarantee a 0x20 ack on every write (independent of prior adapter
+    // state). 0x24 sub 0x01 = network write responses; response cmd is 0x34.
+    unsigned char wr[2] = { 0x01, 0x01 };
+    dviCmd(DVI_SETTINGS, wr, 2, 0x34);
+
+    unsigned char b[2] = { 0x15, baudCode };        // CAN baud rate
+    dviCmd(DVI_CAN, b, 2, DVI_CAN_RESP);
+
+    unsigned char on = (g_chan.protocol == ISO15765) ? 0x01 : 0x00;
+    unsigned char fp[2] = { 0x0B, on };             // auto frame processing
+    dviCmd(DVI_CAN, fp, 2, DVI_CAN_RESP);
+    unsigned char af[2] = { 0x0F, on };             // auto formatting (length byte)
+    dviCmd(DVI_CAN, af, 2, DVI_CAN_RESP);
+
+    if (g_chan.protocol == ISO15765)
+        dviSetFcData();
+
+    reprogramFilters();
+
+    if (dviSetComms(0x01) != STATUS_NOERROR) {      // enable read+write last
+        setLastError("Tool rejected enable-comms");
+        return ERR_FAILED;
+    }
+    return STATUS_NOERROR;
+}
+
+// =========================================================================
+// Transmit (device lock held)
+// =========================================================================
 
 static void loopbackEcho(const PASSTHRU_MSG& msg)
 {
@@ -610,166 +530,101 @@ static void loopbackEcho(const PASSTHRU_MSG& msg)
     enqueueMsg(echo);
 }
 
-static long transmitCanRaw(const PASSTHRU_MSG& msg)
+static unsigned txWaitMs(unsigned long appTimeout, unsigned long extraMs)
 {
-    // Raw CAN channel: ATCAF0 was set at connect, frame goes out as given.
-    if (msg.DataSize - 4 > 8)
-        return ERR_INVALID_MSG;
-
-    bool ok;
-    std::string resp = g_dev.elm.command(buildDxSd(msg), 3000, ok);
-    processResponse(resp);
-    if (!ok)
-        return ERR_TIMEOUT;
-
-    loopbackEcho(msg);
-    return STATUS_NOERROR;
+    unsigned long t = appTimeout ? appTimeout : 2000;
+    if (t < 250)   t = 250;
+    if (t > 10000) t = 10000;
+    return (unsigned)(t + extraMs);
 }
 
-static long transmitIso15765(const PASSTHRU_MSG& msg, unsigned long timeoutMs)
+static long validateMsg(const PASSTHRU_MSG& m)
 {
-    unsigned long len = msg.DataSize - 4;
-    if (len > 4095)
+    if (m.ProtocolID != g_chan.appProtocol)
+        return ERR_MSG_PROTOCOL_ID;
+    if (m.DataSize < 4 || m.DataSize > sizeof(m.Data))
         return ERR_INVALID_MSG;
-
-    // ATCAF1 is active on ISO15765 channels: the OBDX adds the length byte,
-    // segments multi-frame messages and handles flow control itself (using
-    // the FC header/data programmed from the J2534 flow-control filter).
-    // Give long transfers more time: BT round trip + segmented TX on the bus.
-    unsigned waitMs = 3000 + (len / 7) * 10;
-    if (timeoutMs > waitMs)
-        waitMs = timeoutMs;
-
-    bool ok;
-    std::string resp = g_dev.elm.command(buildDxSd(msg), waitMs, ok);
-    processResponse(resp);
-    if (!ok)
-        return ERR_TIMEOUT;
-
-    loopbackEcho(msg);
+    if (g_chan.protocol == CAN && m.DataSize > 12)
+        return ERR_INVALID_MSG;
+    if (g_chan.protocol == ISO15765 && m.DataSize > 4099)
+        return ERR_INVALID_MSG;
     return STATUS_NOERROR;
-}
-
-static long transmitVpw(const PASSTHRU_MSG& msg)
-{
-    // J1850 VPW: J2534 message bytes = priority, target, source, then data.
-    // Set the 3 header bytes via ATSH, send the rest; the tool handles the
-    // CRC. Responses come back as complete frames (headers on).
-    if (msg.DataSize < 4)
-        return ERR_INVALID_MSG;
-
-    char cmd[32];
-    _snprintf(cmd, sizeof(cmd), "ATSH %02X %02X %02X",
-              msg.Data[0], msg.Data[1], msg.Data[2]);
-    if ((long)((msg.Data[0] << 16) | (msg.Data[1] << 8) | msg.Data[2]) != g_chan.curTxHeader) {
-        if (!g_dev.elm.commandOk(cmd))
-            return ERR_FAILED;
-        g_chan.curTxHeader = (msg.Data[0] << 16) | (msg.Data[1] << 8) | msg.Data[2];
-    }
-
-    bool ok;
-    std::string resp = g_dev.elm.command(
-        toHex(msg.Data + 3, msg.DataSize - 3), 6000, ok);
-
-    // Response lines are complete VPW frames (3 header bytes + data).
-    std::vector<std::string> lines;
-    Elm327::splitLines(resp, lines);
-    for (size_t i = 0; i < lines.size(); i++) {
-        std::string hex;
-        bool valid = true;
-        for (size_t j = 0; j < lines[i].size() && valid; j++) {
-            if (lines[i][j] == ' ')
-                continue;
-            if (!isHexDigit(lines[i][j]))
-                valid = false;
-            else
-                hex += lines[i][j];
-        }
-        if (!valid || hex.size() < 2)
-            continue;
-        PASSTHRU_MSG m;
-        memset(&m, 0, sizeof(m));
-        m.ProtocolID = g_chan.appProtocol;
-        m.Timestamp = nowMicros();
-        m.DataSize = (unsigned long)(hex.size() / 2);
-        if (m.DataSize > sizeof(m.Data))
-            m.DataSize = sizeof(m.Data);
-        for (unsigned long j = 0; j < m.DataSize; j++)
-            m.Data[j] = (unsigned char)((hexVal(hex[j*2]) << 4) | hexVal(hex[j*2+1]));
-        m.ExtraDataIndex = m.DataSize;  // CRC already stripped by the tool
-        enqueueMsg(m);
-    }
-    return ok ? STATUS_NOERROR : ERR_TIMEOUT;
 }
 
 static long transmitMsg(const PASSTHRU_MSG& msg, unsigned long timeoutMs)
 {
-    switch (g_chan.protocol) {
-    case CAN:       return transmitCanRaw(msg);
-    case ISO15765:  return transmitIso15765(msg, timeoutMs);
-    case J1850VPW:  return transmitVpw(msg);
+    if (g_dev.dvi.linkDown())
+        return ERR_DEVICE_NOT_CONNECTED;
+
+    unsigned long plen = msg.DataSize - 4;
+
+    // ISO15765 multi-frame needs a flow-control filter owning this tester ID
+    // (J2534 04.04: ERR_NO_FLOW_CONTROL). Single frames (incl. 7DF) do not.
+    if (g_chan.protocol == ISO15765 && plen > 7) {
+        unsigned long id = ((unsigned long)msg.Data[0] << 24) | ((unsigned long)msg.Data[1] << 16) |
+                           ((unsigned long)msg.Data[2] << 8) | msg.Data[3];
+        unsigned long idMask = is29Bit() ? 0x1FFFFFFF : 0x7FF;
+        bool haveFc = false;
+        for (int i = 0; i < MAX_FILTERS && !haveFc; i++) {
+            const Filter& f = g_chan.filters[i];
+            haveFc = f.used && f.type == FLOW_CONTROL_FILTER &&
+                     (f.flowControlId & idMask) == (id & idMask);
+        }
+        if (!haveFc) {
+            setLastError("Multi-frame write to %lX without a flow-control filter",
+                         id & idMask);
+            return ERR_NO_FLOW_CONTROL;
+        }
     }
-    return ERR_INVALID_PROTOCOL_ID;
+
+    // DVI send frame: [id0 id1 id2 id3][payload...]. The tool adds the CAN
+    // length byte and (ISO15765) segments + handles flow control.
+    std::vector<unsigned char> buf;
+    buf.reserve(msg.DataSize);
+    for (unsigned long i = 0; i < msg.DataSize; i++)
+        buf.push_back(msg.Data[i]);
+    bool large = buf.size() > 255;
+    unsigned long extra = (plen > 7) ? (plen / 7) * 10 + 500 : 0;
+
+    DviMsg ack;
+    long rc = dviCmd(large ? DVI_TX_LARGE : DVI_TX_NORMAL, buf.data(), buf.size(),
+                     DVI_TX_ACK, &ack, txWaitMs(timeoutMs, extra), large);
+    if (rc != STATUS_NOERROR)
+        return rc;
+
+    loopbackEcho(msg);
+    return STATUS_NOERROR;
 }
 
 // =========================================================================
 // Worker thread: periodic messages + async RX pump
 // =========================================================================
 
-// In DXPT1 passthrough mode the OBDX streams any frame matching the filters
-// at any time - not just as a response to a transmit. This pump drains them
-// into the RX queue while no command transaction is in flight.
-static std::string g_pumpBuf;
-
-static void pumpIncoming()   // device lock held
-{
-    char buf[1024];
-    int n = g_dev.elm.rawRead(buf, sizeof(buf), 10);
-    while (n > 0) {
-        for (int i = 0; i < n; i++) {
-            char c = buf[i];
-            if (c != '>' && c != '\0')
-                g_pumpBuf += c;
-        }
-        n = g_dev.elm.rawRead(buf, sizeof(buf), 10);
-    }
-
-    size_t pos;
-    while ((pos = g_pumpBuf.find_first_of("\r\n")) != std::string::npos) {
-        std::string line = g_pumpBuf.substr(0, pos);
-        g_pumpBuf.erase(0, pos + 1);
-        if (!line.empty() && g_chan.open)
-            processResponse(line + "\r");
-    }
-    if (g_pumpBuf.size() > 8192)
-        g_pumpBuf.clear();      // runaway partial line - drop it
-}
-
 static DWORD WINAPI workerThreadProc(LPVOID)
 {
     for (;;) {
-        if (WaitForSingleObject(g_dev.periodicStop, 20) == WAIT_OBJECT_0)
+        if (WaitForSingleObject(g_dev.workerStop, 20) == WAIT_OBJECT_0)
             return 0;
-        if (!g_chan.open || !g_dev.open)
-            continue;
 
-        DWORD now = GetTickCount();
-        for (int i = 0; i < MAX_PERIODIC; i++) {
-            PeriodicMsg& p = g_chan.periodic[i];
-            if (!p.used || (long)(now - p.nextDue) < 0)
-                continue;
-            p.nextDue = now + p.intervalMs;
-            EnterCriticalSection(&g_dev.lock);
-            if (g_chan.open && g_dev.open)
+        EnterCriticalSection(&g_dev.lock);
+        if (g_chan.open && g_dev.open && !g_dev.dvi.linkDown()) {
+            DWORD now = GetTickCount();
+            for (int i = 0; i < MAX_PERIODIC; i++) {
+                PeriodicMsg& p = g_chan.periodic[i];
+                if (!p.used || (long)(now - p.nextDue) < 0)
+                    continue;
+                p.nextDue = now + p.intervalMs;
                 transmitMsg(p.msg, 1000);
-            LeaveCriticalSection(&g_dev.lock);
-        }
+            }
 
-        if (TryEnterCriticalSection(&g_dev.lock)) {
-            if (g_chan.open && g_dev.open)
-                pumpIncoming();
-            LeaveCriticalSection(&g_dev.lock);
+            std::vector<DviMsg> net;
+            g_dev.dvi.poll(net, 40);
+            for (size_t i = 0; i < net.size(); i++)
+                routeNetFrame(net[i]);
+
+            isotpSweepStale();
         }
+        LeaveCriticalSection(&g_dev.lock);
     }
 }
 
@@ -779,14 +634,26 @@ static DWORD WINAPI workerThreadProc(LPVOID)
 
 long J2534_API PassThruOpen(void* pName, unsigned long* pDeviceID)
 {
-    ensureInit();
-    Log("PassThruOpen(name=%s)", pName ? (const char*)pName : "(null)");
-
+    if (!g_syncInit)
+        return ERR_FAILED;
     if (!pDeviceID) {
         setLastError("PassThruOpen: NULL pDeviceID");
         return ERR_NULL_PARAMETER;
     }
+
+    EnterCriticalSection(&g_dev.lock);
+    if (!g_cfgLoaded) {
+        loadConfig();
+        LogInit(g_dllDir, g_cfg.log);
+        Log("BlueJ2534 0.3.0 (DVI) (mode=%s, bt='%s'/'%s', com=%s)",
+            g_cfg.mode.c_str(), g_cfg.btAddress.c_str(),
+            g_cfg.btName.c_str(), g_cfg.comPort.c_str());
+        g_cfgLoaded = true;
+    }
+    Log("PassThruOpen(name=%s)", pName ? (const char*)pName : "(null)");
+
     if (g_dev.open) {
+        LeaveCriticalSection(&g_dev.lock);
         setLastError("PassThruOpen: device already open");
         return ERR_DEVICE_IN_USE;
     }
@@ -798,22 +665,46 @@ long J2534_API PassThruOpen(void* pName, unsigned long* pDeviceID)
         t = createBtRfcommTransport(g_cfg.btAddress, g_cfg.btName);
 
     std::string err;
-    EnterCriticalSection(&g_dev.lock);
-    bool ok = g_dev.elm.open(t, err);
-    if (!ok) {
-        g_dev.elm.close();
+    if (!g_dev.dvi.open(t, err)) {
+        g_dev.dvi.close();
         LeaveCriticalSection(&g_dev.lock);
         setLastError("PassThruOpen: %s", err.c_str());
         return ERR_DEVICE_NOT_CONNECTED;
     }
 
+    if (g_dev.workerThread) {
+        if (WaitForSingleObject(g_dev.workerThread, 5000) != WAIT_OBJECT_0) {
+            g_dev.dvi.close();
+            LeaveCriticalSection(&g_dev.lock);
+            setLastError("PassThruOpen: previous session is still shutting down");
+            return ERR_FAILED;
+        }
+        CloseHandle(g_dev.workerThread);
+        g_dev.workerThread = NULL;
+    }
+
+    if (!g_modulePinned && g_hInst) {
+        HMODULE self = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (LPCSTR)&loadConfig, &self);
+        g_modulePinned = true;
+    }
+
     g_dev.open = true;
-    ResetEvent(g_dev.periodicStop);
-    g_dev.periodicThread = CreateThread(NULL, 0, workerThreadProc, NULL, 0, NULL);
+    ResetEvent(g_dev.workerStop);
+    g_dev.workerThread = CreateThread(NULL, 0, workerThreadProc, NULL, 0, NULL);
+    if (!g_dev.workerThread) {
+        g_dev.open = false;
+        g_dev.dvi.close();
+        LeaveCriticalSection(&g_dev.lock);
+        setLastError("PassThruOpen: failed to start the worker thread");
+        return ERR_FAILED;
+    }
     LeaveCriticalSection(&g_dev.lock);
 
     *pDeviceID = DEVICE_ID;
-    Log("PassThruOpen: OK, firmware '%s'", g_dev.elm.firmware().c_str());
+    Log("PassThruOpen: OK, firmware '%s'", g_dev.dvi.firmware().c_str());
     return STATUS_NOERROR;
 }
 
@@ -826,15 +717,23 @@ long J2534_API PassThruClose(unsigned long DeviceID)
     if (g_chan.open)
         PassThruDisconnect(CHANNEL_ID);
 
-    SetEvent(g_dev.periodicStop);
-    if (g_dev.periodicThread) {
-        WaitForSingleObject(g_dev.periodicThread, 2000);
-        CloseHandle(g_dev.periodicThread);
-        g_dev.periodicThread = NULL;
+    SetEvent(g_dev.workerStop);
+    SetEvent(g_chan.rxEvent);
+    if (g_dev.workerThread) {
+        if (WaitForSingleObject(g_dev.workerThread, 10000) == WAIT_OBJECT_0) {
+            CloseHandle(g_dev.workerThread);
+            g_dev.workerThread = NULL;
+        } else {
+            Log("PassThruClose: worker did not exit in 10s (link stalled?)");
+        }
     }
 
     EnterCriticalSection(&g_dev.lock);
-    g_dev.elm.close();
+    if (g_dev.open && !g_dev.dvi.linkDown()) {
+        unsigned char d[2] = { 0x06, 0x00 };        // switch back to ELM mode
+        dviCmd(DVI_PROTO, d, 2, DVI_PROTO_RESP);
+    }
+    g_dev.dvi.close();
     g_dev.open = false;
     LeaveCriticalSection(&g_dev.lock);
     return STATUS_NOERROR;
@@ -844,62 +743,64 @@ long J2534_API PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
                                unsigned long Flags, unsigned long BaudRate,
                                unsigned long* pChannelID)
 {
-    Log("PassThruConnect(dev=%lu proto=%lu flags=0x%lX baud=%lu)",
+    Log("PassThruConnect(dev=%lu proto=0x%lX flags=0x%lX baud=%lu)",
         DeviceID, ProtocolID, Flags, BaudRate);
 
     if (!pChannelID)
         return ERR_NULL_PARAMETER;
     if (DeviceID != DEVICE_ID || !g_dev.open)
         return ERR_INVALID_DEVICE_ID;
-    if (g_chan.open) {
-        setLastError("PassThruConnect: channel already in use (POC supports one channel)");
-        return ERR_CHANNEL_IN_USE;
-    }
 
-    // J2534-2 pin-select protocols map onto the base protocol; the physical
-    // bus is chosen by J1962_PINS (HS-CAN 6/14 default, MS-CAN 3/11).
     unsigned long base = ProtocolID;
     switch (ProtocolID) {
     case CAN_PS:      base = CAN;      break;
     case ISO15765_PS: base = ISO15765; break;
-    case J1850VPW_PS: base = J1850VPW; break;
     case CAN:
-    case ISO15765:
-    case J1850VPW:    break;
+    case ISO15765:    break;
     default:
         setLastError("PassThruConnect: protocol 0x%lX not supported "
-                     "(OBDX Pro FT: CAN/ISO15765[_PS]/J1850VPW)", ProtocolID);
+                     "(OBDX Pro FT: CAN / ISO15765 [_PS] only)", ProtocolID);
         return ERR_INVALID_PROTOCOL_ID;
+    }
+    if (Flags & CAN_ID_BOTH)
+        Log("PassThruConnect: CAN_ID_BOTH not supported; parsing as %s",
+            (Flags & CAN_29BIT_ID) ? "29-bit" : "11-bit");
+
+    EnterCriticalSection(&g_dev.lock);
+    if (g_chan.open) {
+        LeaveCriticalSection(&g_dev.lock);
+        setLastError("PassThruConnect: channel already in use (POC supports one channel)");
+        return ERR_CHANNEL_IN_USE;
     }
 
     g_chan.protocol = base;
     g_chan.appProtocol = ProtocolID;
     g_chan.pins = (BaudRate == 125000) ? 0x030B : 0x060E;
+    g_chan.pinsExplicit = false;
     g_chan.flags = Flags;
-    g_chan.baud = BaudRate;
+    g_chan.baud = BaudRate ? BaudRate : 500000;
     g_chan.loopback = 0;
     g_chan.bs = 0;
     g_chan.stmin = 0;
-    g_chan.curTxHeader = -1;
-    g_chan.curRxAddr = -1;
-    g_chan.curFcHeader = -1;
     memset(g_chan.filters, 0, sizeof(g_chan.filters));
     memset(g_chan.periodic, 0, sizeof(g_chan.periodic));
     g_chan.isotp.clear();
 
-    std::string err;
-    EnterCriticalSection(&g_dev.lock);
-    bool ok = programBus(err);
-    LeaveCriticalSection(&g_dev.lock);
-    if (!ok) {
-        setLastError("PassThruConnect: %s", err.c_str());
-        return ERR_FAILED;
+    long rc = programBus();
+    if (rc != STATUS_NOERROR) {
+        LeaveCriticalSection(&g_dev.lock);
+        if (rc == ERR_INVALID_BAUDRATE)
+            setLastError("PassThruConnect: unsupported baud rate %lu", BaudRate);
+        return rc;
     }
 
     EnterCriticalSection(&g_chan.rxLock);
     g_chan.rxQueue.clear();
+    g_chan.rxOverflowed = false;
     LeaveCriticalSection(&g_chan.rxLock);
+
     g_chan.open = true;
+    LeaveCriticalSection(&g_dev.lock);
 
     *pChannelID = CHANNEL_ID;
     return STATUS_NOERROR;
@@ -911,18 +812,18 @@ long J2534_API PassThruDisconnect(unsigned long ChannelID)
     if (ChannelID != CHANNEL_ID || !g_chan.open)
         return ERR_INVALID_CHANNEL_ID;
 
-    g_chan.open = false;
     EnterCriticalSection(&g_dev.lock);
-    if (g_dev.open) {
-        g_dev.elm.commandOk("DXPT0");   // leave passthrough streaming mode
-        g_dev.elm.commandOk("ATFCSM0");
-        g_dev.elm.commandOk("ATAR");    // reset filters/masks
-    }
+    if (g_dev.open && !g_dev.dvi.linkDown())
+        dviSetComms(0x00);          // stop network comms
+    g_chan.open = false;
+    g_dev.dvi.flush();
+    g_chan.isotp.clear();
     LeaveCriticalSection(&g_dev.lock);
 
     EnterCriticalSection(&g_chan.rxLock);
     g_chan.rxQueue.clear();
     LeaveCriticalSection(&g_chan.rxLock);
+    SetEvent(g_chan.rxEvent);
     return STATUS_NOERROR;
 }
 
@@ -932,12 +833,13 @@ long J2534_API PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG* pMsg,
     if (!pMsg || !pNumMsgs)
         return ERR_NULL_PARAMETER;
     if (ChannelID != CHANNEL_ID || !g_chan.open) {
-        *pNumMsgs = 0;
+        if (pNumMsgs) *pNumMsgs = 0;
         return ERR_INVALID_CHANNEL_ID;
     }
 
     unsigned long want = *pNumMsgs;
     unsigned long got = 0;
+    Timeout = clampTimeout(Timeout);
     DWORD deadline = GetTickCount() + Timeout;
 
     for (;;) {
@@ -950,16 +852,26 @@ long J2534_API PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG* pMsg,
 
         if (got >= want || Timeout == 0)
             break;
+        if (!g_chan.open) {
+            *pNumMsgs = got;
+            return got ? STATUS_NOERROR : ERR_INVALID_CHANNEL_ID;
+        }
+        if (g_dev.dvi.linkDown())
+            break;
         long remain = (long)(deadline - GetTickCount());
         if (remain <= 0)
             break;
-        WaitForSingleObject(g_chan.rxEvent, remain);
+        WaitForSingleObject(g_chan.rxEvent, remain > 100 ? 100 : remain);
     }
 
     *pNumMsgs = got;
-    if (got == 0)
-        return Timeout == 0 ? ERR_BUFFER_EMPTY : ERR_TIMEOUT;
-    return STATUS_NOERROR;
+    if (got >= want)
+        return STATUS_NOERROR;
+    if (got == 0 && g_dev.dvi.linkDown())
+        return ERR_DEVICE_NOT_CONNECTED;
+    if (Timeout == 0)
+        return got ? STATUS_NOERROR : ERR_BUFFER_EMPTY;
+    return ERR_TIMEOUT;
 }
 
 long J2534_API PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG* pMsg,
@@ -975,23 +887,21 @@ long J2534_API PassThruWriteMsgs(unsigned long ChannelID, PASSTHRU_MSG* pMsg,
     unsigned long count = *pNumMsgs;
     unsigned long sent = 0;
     long rc = STATUS_NOERROR;
+    Timeout = clampTimeout(Timeout);
 
     for (unsigned long i = 0; i < count; i++) {
         PASSTHRU_MSG& m = pMsg[i];
-        if (m.ProtocolID != g_chan.appProtocol) {
-            rc = ERR_MSG_PROTOCOL_ID;
+        rc = validateMsg(m);
+        if (rc != STATUS_NOERROR)
             break;
-        }
-        if (m.DataSize < 4 || m.DataSize > sizeof(m.Data)) {
-            rc = ERR_INVALID_MSG;
-            break;
-        }
-        Log("PassThruWriteMsgs: %lu bytes [%s]", m.DataSize,
-            toHex(m.Data, m.DataSize > 16 ? 16 : m.DataSize).c_str());
 
         EnterCriticalSection(&g_dev.lock);
-        rc = g_dev.open ? transmitMsg(m, Timeout ? Timeout : 3000)
-                        : ERR_DEVICE_NOT_CONNECTED;
+        if (!g_dev.open)
+            rc = ERR_DEVICE_NOT_CONNECTED;
+        else if (!g_chan.open)
+            rc = ERR_INVALID_CHANNEL_ID;
+        else
+            rc = transmitMsg(m, Timeout);
         LeaveCriticalSection(&g_dev.lock);
         if (rc != STATUS_NOERROR)
             break;
@@ -1012,17 +922,24 @@ long J2534_API PassThruStartPeriodicMsg(unsigned long ChannelID, PASSTHRU_MSG* p
     if (TimeInterval < 5 || TimeInterval > 65535)
         return ERR_INVALID_TIME_INTERVAL;
 
+    long rc = validateMsg(*pMsg);
+    if (rc != STATUS_NOERROR)
+        return rc;
+
+    EnterCriticalSection(&g_dev.lock);
     for (int i = 0; i < MAX_PERIODIC; i++) {
         if (!g_chan.periodic[i].used) {
             g_chan.periodic[i].msg = *pMsg;
             g_chan.periodic[i].intervalMs = TimeInterval;
             g_chan.periodic[i].nextDue = GetTickCount();
             g_chan.periodic[i].used = true;
+            LeaveCriticalSection(&g_dev.lock);
             *pMsgID = i + 1;
             Log("StartPeriodicMsg: id=%d interval=%lums", i + 1, TimeInterval);
             return STATUS_NOERROR;
         }
     }
+    LeaveCriticalSection(&g_dev.lock);
     return ERR_EXCEEDED_LIMIT;
 }
 
@@ -1030,10 +947,14 @@ long J2534_API PassThruStopPeriodicMsg(unsigned long ChannelID, unsigned long Ms
 {
     if (ChannelID != CHANNEL_ID || !g_chan.open)
         return ERR_INVALID_CHANNEL_ID;
-    if (MsgID < 1 || MsgID > MAX_PERIODIC || !g_chan.periodic[MsgID - 1].used)
+    if (MsgID < 1 || MsgID > MAX_PERIODIC)
         return ERR_INVALID_MSG_ID;
+
+    EnterCriticalSection(&g_dev.lock);
+    bool was = g_chan.periodic[MsgID - 1].used;
     g_chan.periodic[MsgID - 1].used = false;
-    return STATUS_NOERROR;
+    LeaveCriticalSection(&g_dev.lock);
+    return was ? STATUS_NOERROR : ERR_INVALID_MSG_ID;
 }
 
 long J2534_API PassThruStartMsgFilter(unsigned long ChannelID, unsigned long FilterType,
@@ -1050,49 +971,62 @@ long J2534_API PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Fil
             return ERR_MSG_PROTOCOL_ID;
         if (!pFlowControlMsg)
             return ERR_NULL_PARAMETER;
+        if (pMaskMsg->DataSize != 4 || pPatternMsg->DataSize != 4 ||
+            pFlowControlMsg->DataSize != 4)
+            return ERR_INVALID_MSG;
     } else if (FilterType != PASS_FILTER && FilterType != BLOCK_FILTER) {
         return ERR_INVALID_MSG;
     } else if (pFlowControlMsg) {
-        return ERR_INVALID_MSG;     // only FLOW_CONTROL takes a third message
+        return ERR_INVALID_MSG;
+    } else if (pMaskMsg->DataSize != 4 || pPatternMsg->DataSize != 4) {
+        return ERR_INVALID_MSG;
     }
 
-    if (pMaskMsg->DataSize < 4 || pPatternMsg->DataSize < 4)
-        return ERR_INVALID_MSG;
-
+    EnterCriticalSection(&g_dev.lock);
     int slot = -1;
     for (int i = 0; i < MAX_FILTERS; i++) {
         if (!g_chan.filters[i].used) { slot = i; break; }
     }
-    if (slot < 0)
-        return ERR_EXCEEDED_LIMIT;
-
-    Filter& f = g_chan.filters[slot];
-    f.type = FilterType;
-    f.maskId    = ((unsigned long)pMaskMsg->Data[0] << 24) | (pMaskMsg->Data[1] << 16) |
-                  (pMaskMsg->Data[2] << 8) | pMaskMsg->Data[3];
-    f.patternId = ((unsigned long)pPatternMsg->Data[0] << 24) | (pPatternMsg->Data[1] << 16) |
-                  (pPatternMsg->Data[2] << 8) | pPatternMsg->Data[3];
-    f.flowControlId = 0;
-    f.flags = pPatternMsg->TxFlags;
-
-    if (FilterType == FLOW_CONTROL_FILTER) {
-        f.flowControlId = ((unsigned long)pFlowControlMsg->Data[0] << 24) |
-                          (pFlowControlMsg->Data[1] << 16) |
-                          (pFlowControlMsg->Data[2] << 8) | pFlowControlMsg->Data[3];
-
-        // Program the ELM: receive only the pattern ID, auto-answer First
-        // Frames with a flow control frame from our tester ID.
-        EnterCriticalSection(&g_dev.lock);
-        bool ok = elmSetRxAddr(f.patternId);
-        ok = elmSetFlowControl(f.flowControlId) && ok;
+    if (slot < 0) {
         LeaveCriticalSection(&g_dev.lock);
-        if (!ok) {
-            setLastError("StartMsgFilter: ELM327 rejected filter programming");
-            return ERR_FAILED;
-        }
+        return ERR_EXCEEDED_LIMIT;
     }
 
+    Filter& f = g_chan.filters[slot];
+    memset(&f, 0, sizeof(f));
+    f.type = FilterType;
+    f.maskId    = ((unsigned long)pMaskMsg->Data[0] << 24) | ((unsigned long)pMaskMsg->Data[1] << 16) |
+                  ((unsigned long)pMaskMsg->Data[2] << 8) | pMaskMsg->Data[3];
+    f.patternId = ((unsigned long)pPatternMsg->Data[0] << 24) | ((unsigned long)pPatternMsg->Data[1] << 16) |
+                  ((unsigned long)pPatternMsg->Data[2] << 8) | pPatternMsg->Data[3];
+    if (FilterType == FLOW_CONTROL_FILTER)
+        f.flowControlId = ((unsigned long)pFlowControlMsg->Data[0] << 24) |
+                          ((unsigned long)pFlowControlMsg->Data[1] << 16) |
+                          ((unsigned long)pFlowControlMsg->Data[2] << 8) | pFlowControlMsg->Data[3];
     f.used = true;
+
+    // Program this one DVI filter slot (comms stays on - framing is clean).
+    unsigned char nn = is29Bit() ? 0x01 : 0x00;
+    unsigned char xx = (f.type == PASS_FILTER) ? 0x00 : (f.type == BLOCK_FILTER) ? 0x02 : 0x01;
+    unsigned char d[17];
+    d[0] = 0x00; d[1] = (unsigned char)slot; d[2] = nn; d[3] = xx; d[4] = 0x01;
+    d[5]  = (unsigned char)(f.patternId >> 24); d[6]  = (unsigned char)(f.patternId >> 16);
+    d[7]  = (unsigned char)(f.patternId >> 8);  d[8]  = (unsigned char)(f.patternId);
+    d[9]  = (unsigned char)(f.maskId >> 24);    d[10] = (unsigned char)(f.maskId >> 16);
+    d[11] = (unsigned char)(f.maskId >> 8);     d[12] = (unsigned char)(f.maskId);
+    d[13] = (unsigned char)(f.flowControlId >> 24); d[14] = (unsigned char)(f.flowControlId >> 16);
+    d[15] = (unsigned char)(f.flowControlId >> 8);  d[16] = (unsigned char)(f.flowControlId);
+    long rc = dviCmd(DVI_CAN, d, 17, DVI_CAN_RESP);
+    LeaveCriticalSection(&g_dev.lock);
+
+    if (rc != STATUS_NOERROR) {
+        EnterCriticalSection(&g_dev.lock);
+        f.used = false;
+        LeaveCriticalSection(&g_dev.lock);
+        setLastError("StartMsgFilter: tool rejected filter programming");
+        return rc;
+    }
+
     *pFilterID = slot + 1;
     Log("StartMsgFilter: id=%d type=%lu mask=%08lX pattern=%08lX fc=%08lX",
         slot + 1, FilterType, f.maskId, f.patternId, f.flowControlId);
@@ -1103,20 +1037,21 @@ long J2534_API PassThruStopMsgFilter(unsigned long ChannelID, unsigned long Filt
 {
     if (ChannelID != CHANNEL_ID || !g_chan.open)
         return ERR_INVALID_CHANNEL_ID;
-    if (FilterID < 1 || FilterID > MAX_FILTERS || !g_chan.filters[FilterID - 1].used)
+    if (FilterID < 1 || FilterID > MAX_FILTERS)
         return ERR_INVALID_FILTER_ID;
 
+    EnterCriticalSection(&g_dev.lock);
     Filter& f = g_chan.filters[FilterID - 1];
-    if (f.type == FLOW_CONTROL_FILTER) {
-        EnterCriticalSection(&g_dev.lock);
-        if (g_dev.open) {
-            elmClearRxAddr();
-            g_dev.elm.commandOk("ATFCSM0");
-            g_chan.curFcHeader = -1;
-        }
+    if (!f.used) {
         LeaveCriticalSection(&g_dev.lock);
+        return ERR_INVALID_FILTER_ID;
     }
     f.used = false;
+    unsigned char nn = is29Bit() ? 0x01 : 0x00;
+    unsigned char d[4] = { 0x05, (unsigned char)(FilterID - 1), nn, 0x00 };   // disable slot
+    if (g_dev.open && !g_dev.dvi.linkDown())
+        dviCmd(DVI_CAN, d, 4, DVI_CAN_RESP);
+    LeaveCriticalSection(&g_dev.lock);
     return STATUS_NOERROR;
 }
 
@@ -1124,12 +1059,33 @@ long J2534_API PassThruSetProgrammingVoltage(unsigned long DeviceID,
                                              unsigned long PinNumber,
                                              unsigned long Voltage)
 {
-    Log("PassThruSetProgrammingVoltage(pin=%lu, mV=%lu) - not supported on ELM327",
-        PinNumber, Voltage);
+    Log("PassThruSetProgrammingVoltage(pin=%lu, mV=0x%lX)", PinNumber, Voltage);
     if (DeviceID != DEVICE_ID || !g_dev.open)
         return ERR_INVALID_DEVICE_ID;
-    setLastError("Programming voltage is not supported by ELM327 hardware");
-    return ERR_NOT_SUPPORTED;
+    if (PinNumber != 13) {
+        setLastError("Only pin 13 (Ford FEPS) is supported on the OBDX Pro FT");
+        return ERR_PIN_INVALID;
+    }
+    if (Voltage == 0xFFFFFFFE) {
+        setLastError("SHORT_TO_GROUND is not supported on the FEPS pin");
+        return ERR_NOT_SUPPORTED;
+    }
+
+    unsigned char relay = (Voltage == 0xFFFFFFFF) ? 0x00 : 0x01;   // VOLTAGE_OFF
+    if (relay && (Voltage < 15000 || Voltage > 20000))
+        Log("FEPS voltage is fixed ~18V on the FT (requested %lumV)", Voltage);
+
+    EnterCriticalSection(&g_dev.lock);
+    unsigned char r[2] = { 0x02, relay };     // FEPS relay
+    unsigned char v[2] = { 0x03, relay };     // FEPS voltage regulator
+    long rc = dviCmd(DVI_ADC, r, 2, DVI_ADC_RESP);
+    if (rc == STATUS_NOERROR)
+        rc = dviCmd(DVI_ADC, v, 2, DVI_ADC_RESP);
+    LeaveCriticalSection(&g_dev.lock);
+
+    if (rc != STATUS_NOERROR)
+        setLastError("Tool rejected the FEPS (DVI 0x3A) command");
+    return rc;
 }
 
 long J2534_API PassThruReadVersion(unsigned long DeviceID, char* pFirmwareVersion,
@@ -1140,12 +1096,12 @@ long J2534_API PassThruReadVersion(unsigned long DeviceID, char* pFirmwareVersio
     if (DeviceID != DEVICE_ID || !g_dev.open)
         return ERR_INVALID_DEVICE_ID;
 
-    std::string fw = g_dev.elm.firmware();
+    std::string fw = g_dev.dvi.firmware();
     if (fw.empty())
-        fw = "ELM327 (unknown)";
+        fw = "OBDX Pro FT (unknown)";
     strncpy(pFirmwareVersion, fw.c_str(), 79);
     pFirmwareVersion[79] = 0;
-    strcpy(pDllVersion, "BlueJ2534 0.1.0");
+    strcpy(pDllVersion, "BlueJ2534 0.3.0 DVI");
     strcpy(pApiVersion, "04.04");
     return STATUS_NOERROR;
 }
@@ -1154,7 +1110,9 @@ long J2534_API PassThruGetLastError(char* pErrorDescription)
 {
     if (!pErrorDescription)
         return ERR_NULL_PARAMETER;
+    AcquireSRWLockShared(&g_errLock);
     strncpy(pErrorDescription, g_lastError, 79);
+    ReleaseSRWLockShared(&g_errLock);
     pErrorDescription[79] = 0;
     return STATUS_NOERROR;
 }
@@ -1162,13 +1120,16 @@ long J2534_API PassThruGetLastError(char* pErrorDescription)
 long J2534_API PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
                              void* pInput, void* pOutput)
 {
-    Log("PassThruIoctl(chan=%lu, ioctl=0x%lX)", ChannelID, IoctlID);
+    Log("PassThruIoctl(id=%lu, ioctl=0x%lX)", ChannelID, IoctlID);
 
     switch (IoctlID) {
     case GET_CONFIG: {
+        if (ChannelID != CHANNEL_ID || !g_chan.open)
+            return ERR_INVALID_CHANNEL_ID;
         SCONFIG_LIST* list = (SCONFIG_LIST*)pInput;
         if (!list || !list->ConfigPtr)
             return ERR_NULL_PARAMETER;
+        EnterCriticalSection(&g_dev.lock);
         for (unsigned long i = 0; i < list->NumOfParams; i++) {
             SCONFIG& c = list->ConfigPtr[i];
             switch (c.Parameter) {
@@ -1178,129 +1139,140 @@ long J2534_API PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
             case ISO15765_STMIN: c.Value = g_chan.stmin;   break;
             case J1962_PINS:     c.Value = g_chan.pins;    break;
             case BS_TX:
-            case STMIN_TX:       c.Value = 0xFFFF;         break; // use FC from ECU
-            default:             c.Value = 0;              break;
+            case STMIN_TX:       c.Value = 0xFFFF;         break;
+            default:
+                Log("GET_CONFIG: parameter 0x%lX unknown, returning 0", c.Parameter);
+                c.Value = 0;
+                break;
             }
         }
+        LeaveCriticalSection(&g_dev.lock);
         return STATUS_NOERROR;
     }
     case SET_CONFIG: {
+        if (ChannelID != CHANNEL_ID || !g_chan.open)
+            return ERR_INVALID_CHANNEL_ID;
         SCONFIG_LIST* list = (SCONFIG_LIST*)pInput;
         if (!list || !list->ConfigPtr)
             return ERR_NULL_PARAMETER;
-        for (unsigned long i = 0; i < list->NumOfParams; i++) {
+
+        long rc = STATUS_NOERROR;
+        EnterCriticalSection(&g_dev.lock);
+        for (unsigned long i = 0; i < list->NumOfParams && rc == STATUS_NOERROR; i++) {
             SCONFIG& c = list->ConfigPtr[i];
             switch (c.Parameter) {
             case DATA_RATE: {
-                // Live baud change = bus reprogram (e.g. 500k <-> 125k).
-                if (g_chan.baud != c.Value) {
-                    g_chan.baud = c.Value;
-                    if (g_chan.open && g_dev.open &&
-                        (g_chan.protocol == CAN || g_chan.protocol == ISO15765)) {
-                        std::string err;
-                        EnterCriticalSection(&g_dev.lock);
-                        bool ok = programBus(err);
-                        LeaveCriticalSection(&g_dev.lock);
-                        if (!ok) {
-                            setLastError("SET_CONFIG DATA_RATE: %s", err.c_str());
-                            return ERR_FAILED;
-                        }
-                    }
+                if (g_chan.baud == c.Value)
+                    break;
+                unsigned long newPins = g_chan.pins;
+                if (!g_chan.pinsExplicit)
+                    newPins = (c.Value == 125000) ? 0x030B : 0x060E;
+                unsigned char p, b; long e;
+                if (!dviProtocolCodes(g_chan.protocol, newPins, c.Value, &p, &b, &e)) {
+                    setLastError("SET_CONFIG DATA_RATE: unsupported rate %lu", c.Value);
+                    rc = ERR_INVALID_IOCTL_VALUE;
+                    break;
                 }
+                unsigned long ob = g_chan.baud, op = g_chan.pins;
+                g_chan.baud = c.Value; g_chan.pins = newPins;
+                rc = programBus();
+                if (rc != STATUS_NOERROR) { g_chan.baud = ob; g_chan.pins = op; }
                 break;
             }
-            case LOOPBACK:       g_chan.loopback = c.Value ? 1 : 0; break;
-            case ISO15765_BS:    g_chan.bs = c.Value;      g_chan.curFcHeader = -1; break;
-            case ISO15765_STMIN: g_chan.stmin = c.Value;   g_chan.curFcHeader = -1; break;
+            case LOOPBACK:
+                g_chan.loopback = c.Value ? 1 : 0;
+                break;
+            case ISO15765_BS:
+            case ISO15765_STMIN:
+                if (c.Parameter == ISO15765_BS) g_chan.bs = c.Value & 0xFF;
+                else                            g_chan.stmin = c.Value & 0xFF;
+                if (g_chan.protocol == ISO15765)
+                    dviSetFcData();
+                break;
             case J1962_PINS: {
-                // Bus switch: 0x060E (or 0) = HS-CAN pins 6/14,
-                // 0x030B = MS-CAN pins 3/11 (OBDX protocol E).
                 unsigned long pins = c.Value ? c.Value : 0x060E;
                 if (pins != 0x060E && pins != 0x030B) {
-                    setLastError("SET_CONFIG J1962_PINS: unsupported pin pair 0x%04lX "
-                                 "(0x060E=HS-CAN, 0x030B=MS-CAN)", pins);
-                    return ERR_INVALID_IOCTL_VALUE;
+                    setLastError("SET_CONFIG J1962_PINS: unsupported pin pair 0x%04lX", pins);
+                    rc = ERR_INVALID_IOCTL_VALUE;
+                    break;
                 }
-                if (pins != g_chan.pins) {
-                    g_chan.pins = pins;
-                    if (g_chan.open && g_dev.open) {
-                        std::string err;
-                        EnterCriticalSection(&g_dev.lock);
-                        bool ok = programBus(err);
-                        LeaveCriticalSection(&g_dev.lock);
-                        if (!ok) {
-                            setLastError("SET_CONFIG J1962_PINS: %s", err.c_str());
-                            return ERR_FAILED;
-                        }
-                        Log("Bus switched to %s",
-                            pins == 0x030B ? "MS-CAN (pins 3/11)" : "HS-CAN (pins 6/14)");
-                    }
-                }
+                g_chan.pinsExplicit = true;
+                if (pins == g_chan.pins)
+                    break;
+                unsigned long ob = g_chan.baud, op = g_chan.pins;
+                g_chan.pins = pins;
+                if (pins == 0x030B) g_chan.baud = 125000;
+                rc = programBus();
+                if (rc != STATUS_NOERROR) { g_chan.baud = ob; g_chan.pins = op; }
+                else Log("Bus switched to %s", pins == 0x030B ? "MS-CAN (3/11)" : "HS-CAN (6/14)");
                 break;
             }
             default:
-                Log("SET_CONFIG: parameter 0x%lX=%lu accepted (no-op)",
-                    c.Parameter, c.Value);
+                Log("SET_CONFIG: parameter 0x%lX=%lu accepted (no-op)", c.Parameter, c.Value);
                 break;
             }
         }
-        return STATUS_NOERROR;
+        LeaveCriticalSection(&g_dev.lock);
+        return rc;
     }
     case READ_VBATT: {
+        if (ChannelID != DEVICE_ID || !g_dev.open)
+            return ERR_INVALID_DEVICE_ID;
         if (!pOutput)
             return ERR_NULL_PARAMETER;
-        if (!g_dev.open)
-            return ERR_INVALID_DEVICE_ID;
         EnterCriticalSection(&g_dev.lock);
-        bool ok;
-        std::string r = g_dev.elm.command("ATRV", 2000, ok);
+        unsigned char q[2] = { 0x00, 0xFE };    // single ADC, channel FE = mV
+        DviMsg resp;
+        long rc = dviCmd(DVI_ADC, q, 2, DVI_ADC_RESP, &resp);
         LeaveCriticalSection(&g_dev.lock);
-        float volts = 0.0f;
-        if (sscanf(r.c_str(), " %f", &volts) != 1) {
-            // response may have leading junk; scan for a digit
-            for (size_t i = 0; i < r.size(); i++) {
-                if (r[i] >= '0' && r[i] <= '9') {
-                    sscanf(r.c_str() + i, "%f", &volts);
-                    break;
-                }
-            }
+        if (rc != STATUS_NOERROR)
+            return rc;
+        // resp.data = [sub, channel, NN, MM] -> mV = (NN<<8)|MM
+        if (resp.data.size() >= 4) {
+            unsigned long mv = ((unsigned long)resp.data[2] << 8) | resp.data[3];
+            *(unsigned long*)pOutput = mv;
+            return STATUS_NOERROR;
         }
-        *(unsigned long*)pOutput = (unsigned long)(volts * 1000.0f);
-        return STATUS_NOERROR;
+        setLastError("READ_VBATT: short ADC response");
+        return ERR_FAILED;
     }
     case CLEAR_RX_BUFFER:
         if (ChannelID != CHANNEL_ID || !g_chan.open)
             return ERR_INVALID_CHANNEL_ID;
+        EnterCriticalSection(&g_dev.lock);
+        g_chan.isotp.clear();
+        LeaveCriticalSection(&g_dev.lock);
         EnterCriticalSection(&g_chan.rxLock);
         g_chan.rxQueue.clear();
         LeaveCriticalSection(&g_chan.rxLock);
-        g_chan.isotp.clear();
         return STATUS_NOERROR;
     case CLEAR_TX_BUFFER:
-        return STATUS_NOERROR;  // we transmit synchronously; nothing queued
+        if (ChannelID != CHANNEL_ID || !g_chan.open)
+            return ERR_INVALID_CHANNEL_ID;
+        return STATUS_NOERROR;
     case CLEAR_PERIODIC_MSGS:
         if (ChannelID != CHANNEL_ID || !g_chan.open)
             return ERR_INVALID_CHANNEL_ID;
+        EnterCriticalSection(&g_dev.lock);
         memset(g_chan.periodic, 0, sizeof(g_chan.periodic));
+        LeaveCriticalSection(&g_dev.lock);
         return STATUS_NOERROR;
     case CLEAR_MSG_FILTERS:
         if (ChannelID != CHANNEL_ID || !g_chan.open)
             return ERR_INVALID_CHANNEL_ID;
-        memset(g_chan.filters, 0, sizeof(g_chan.filters));
         EnterCriticalSection(&g_dev.lock);
-        if (g_dev.open) {
-            elmClearRxAddr();
-            g_dev.elm.commandOk("ATFCSM0");
-            g_chan.curFcHeader = -1;
-        }
+        memset(g_chan.filters, 0, sizeof(g_chan.filters));
+        if (g_dev.open && !g_dev.dvi.linkDown())
+            reprogramFilters();
         LeaveCriticalSection(&g_dev.lock);
         return STATUS_NOERROR;
     case FAST_INIT:
     case FIVE_BAUD_INIT:
-        setLastError("K-line init not available: the OBDX Pro FT has no "
-                     "ISO9141/ISO14230 support");
+        setLastError("K-line init not available on the CAN-only OBDX Pro FT");
         return ERR_NOT_SUPPORTED;
     case READ_PROG_VOLTAGE:
+        if (ChannelID != DEVICE_ID || !g_dev.open)
+            return ERR_INVALID_DEVICE_ID;
         if (!pOutput)
             return ERR_NULL_PARAMETER;
         *(unsigned long*)pOutput = 0;
@@ -1315,7 +1287,7 @@ long J2534_API PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
 // DllMain
 // =========================================================================
 
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpvReserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hInst;
@@ -1323,13 +1295,23 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         char* slash = strrchr(g_dllDir, '\\');
         if (slash)
             *slash = 0;
-        loadConfig();
-        LogInit(g_dllDir, g_cfg.log);
-        Log("BlueJ2534 loaded (mode=%s, bt='%s'/'%s', com=%s)",
-            g_cfg.mode.c_str(), g_cfg.btAddress.c_str(),
-            g_cfg.btName.c_str(), g_cfg.comPort.c_str());
+        InitializeCriticalSection(&g_dev.lock);
+        InitializeCriticalSection(&g_chan.rxLock);
+        g_chan.rxEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+        g_dev.workerStop = CreateEventA(NULL, TRUE, FALSE, NULL);
+        g_syncInit = (g_chan.rxEvent && g_dev.workerStop);
         DisableThreadLibraryCalls(hInst);
     } else if (reason == DLL_PROCESS_DETACH) {
+        if (g_dev.workerThread && lpvReserved == NULL) {
+            SetEvent(g_dev.workerStop);     // module is pinned; leak sync objs
+            return TRUE;
+        }
+        if (lpvReserved == NULL && g_syncInit && !g_dev.workerThread) {
+            DeleteCriticalSection(&g_dev.lock);
+            DeleteCriticalSection(&g_chan.rxLock);
+            if (g_chan.rxEvent)   CloseHandle(g_chan.rxEvent);
+            if (g_dev.workerStop) CloseHandle(g_dev.workerStop);
+        }
         LogShutdown();
     }
     return TRUE;

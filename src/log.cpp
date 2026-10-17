@@ -26,6 +26,21 @@ void LogInit(const char* dllDir, bool enabled)
     _snprintf(path, sizeof(path), "%s\\BlueJ2534.log", dllDir);
     path[MAX_PATH - 1] = 0;
     g_logFile = fopen(path, "a");
+    if (!g_logFile) {
+        // Install dir may be unwritable (Program Files, non-elevated app):
+        // fall back to %LOCALAPPDATA%\BlueJ2534\BlueJ2534.log.
+        char base[MAX_PATH];
+        DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            char dir[MAX_PATH];
+            _snprintf(dir, sizeof(dir), "%s\\BlueJ2534", base);
+            dir[MAX_PATH - 1] = 0;
+            CreateDirectoryA(dir, NULL);
+            _snprintf(path, sizeof(path), "%s\\BlueJ2534.log", dir);
+            path[MAX_PATH - 1] = 0;
+            g_logFile = fopen(path, "a");
+        }
+    }
     if (g_logFile) {
         SYSTEMTIME st;
         GetLocalTime(&st);
@@ -37,10 +52,16 @@ void LogInit(const char* dllDir, bool enabled)
 
 void LogShutdown()
 {
+    if (!g_lockInit) {
+        if (g_logFile) { fclose(g_logFile); g_logFile = NULL; }
+        return;
+    }
+    EnterCriticalSection(&g_logLock);
     if (g_logFile) {
         fclose(g_logFile);
         g_logFile = NULL;
     }
+    LeaveCriticalSection(&g_logLock);
 }
 
 bool LogEnabled()
@@ -50,10 +71,14 @@ bool LogEnabled()
 
 void Log(const char* fmt, ...)
 {
-    if (!g_enabled || !g_logFile)
+    if (!g_enabled || !g_logFile || !g_lockInit)
         return;
 
     EnterCriticalSection(&g_logLock);
+    if (!g_logFile) {               // closed while we were outside the lock
+        LeaveCriticalSection(&g_logLock);
+        return;
+    }
     SYSTEMTIME st;
     GetLocalTime(&st);
     fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);

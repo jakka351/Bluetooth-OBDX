@@ -6,7 +6,9 @@
 #include <ws2bth.h>
 #include <windows.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <string>
+#include <vector>
 
 #include "transport.h"
 #include "log.h"
@@ -23,13 +25,24 @@ static const GUID SPP_SERVICE_UUID =
 
 static bool parseBtAddress(const std::string& s, ULONGLONG& out)
 {
-    unsigned int b[6];
-    if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6 &&
-        sscanf(s.c_str(), "%2x%2x%2x%2x%2x%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+    // Accept AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF and AABBCCDDEEFF.
+    std::string hex;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (c == ':' || c == '-' || c == ' ')
+            continue;
+        if (!isxdigit((unsigned char)c))
+            return false;
+        hex += c;
+    }
+    if (hex.size() != 12)
         return false;
     out = 0;
-    for (int i = 0; i < 6; i++)
-        out = (out << 8) | (ULONGLONG)(b[i] & 0xFF);
+    for (size_t i = 0; i < 12; i++) {
+        int v = isdigit((unsigned char)hex[i]) ? hex[i] - '0'
+                                               : (tolower((unsigned char)hex[i]) - 'a' + 10);
+        out = (out << 4) | (ULONGLONG)v;
+    }
     return true;
 }
 
@@ -55,12 +68,21 @@ static bool discoverByName(const std::string& nameSub, ULONGLONG& addr, std::str
         wanted += (wchar_t)towlower((unsigned char)nameSub[i]);
 
     bool found = false;
-    char buf[8192];
+    std::vector<char> buf(8192);
     for (;;) {
-        DWORD len = sizeof(buf);
-        WSAQUERYSETW* res = (WSAQUERYSETW*)buf;
-        if (WSALookupServiceNextW(hLookup, LUP_RETURN_NAME | LUP_RETURN_ADDR, &len, res) != 0)
+        DWORD len = (DWORD)buf.size();
+        WSAQUERYSETW* res = (WSAQUERYSETW*)buf.data();
+        if (WSALookupServiceNextW(hLookup, LUP_RETURN_NAME | LUP_RETURN_ADDR, &len, res) != 0) {
+            int we = WSAGetLastError();
+            if (we == WSAEFAULT && len > buf.size()) {
+                // One oversized record must not end the whole inquiry.
+                buf.resize(len);
+                continue;
+            }
+            if (we != WSA_E_NO_MORE && we != WSAENOMORE && we != WSAENOTCONN)
+                Log("BT inquiry: enumeration stopped with WSA error %d", we);
             break;
+        }
 
         std::wstring name = res->lpszServiceInstanceName ? res->lpszServiceInstanceName : L"";
         std::wstring lower;
@@ -137,11 +159,17 @@ public:
 
         if (connect(m_sock, (SOCKADDR*)&sab, sizeof(sab)) != 0) {
             err = "Bluetooth RFCOMM connect failed, WSA error " + std::to_string(WSAGetLastError()) +
-                  " (is the ELM327 powered and paired?)";
+                  " (is the adapter powered and paired?)";
             closesocket(m_sock);
             m_sock = INVALID_SOCKET;
             return false;
         }
+
+        // Bound sends so a stalled link cannot hang the caller (which holds
+        // the device lock) forever.
+        DWORD sndTimeout = 5000;
+        setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO,
+                   (const char*)&sndTimeout, sizeof(sndTimeout));
 
         Log("BT: connected");
         return true;
@@ -246,7 +274,13 @@ public:
             SetCommState(m_h, &dcb);   // BT virtual COM ports often ignore this; non-fatal
         }
 
-        // Timeouts are controlled per-read via COMMTIMEOUTS in read().
+        COMMTIMEOUTS ct;
+        memset(&ct, 0, sizeof(ct));
+        ct.ReadIntervalTimeout = 20;
+        ct.ReadTotalTimeoutConstant = 1000;
+        ct.WriteTotalTimeoutConstant = 5000;     // writes bounded from the start
+        SetCommTimeouts(m_h, &ct);
+
         Log("COM: opened %s", m_port.c_str());
         return true;
     }
@@ -265,10 +299,19 @@ public:
     {
         if (m_h == INVALID_HANDLE_VALUE)
             return false;
-        DWORD written = 0;
-        if (!WriteFile(m_h, data, (DWORD)len, &written, NULL))
-            return false;
-        return written == (DWORD)len;
+        // WriteTotalTimeoutConstant (set in read(), and defaulted here on
+        // the first write) bounds this; loop in case of a partial write.
+        const char* p = (const char*)data;
+        while (len > 0) {
+            DWORD written = 0;
+            if (!WriteFile(m_h, p, (DWORD)len, &written, NULL))
+                return false;
+            if (written == 0)
+                return false;        // write timeout - link is stalled
+            p += written;
+            len -= (int)written;
+        }
+        return true;
     }
 
     int read(void* buf, int maxlen, unsigned timeoutMs)
@@ -280,6 +323,7 @@ public:
         memset(&ct, 0, sizeof(ct));
         ct.ReadIntervalTimeout = 20;             // return once bytes stop flowing
         ct.ReadTotalTimeoutConstant = timeoutMs;
+        ct.WriteTotalTimeoutConstant = 5000;     // bound writes too
         SetCommTimeouts(m_h, &ct);
 
         DWORD got = 0;

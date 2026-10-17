@@ -1,0 +1,18 @@
+# Build output
+bin/
+
+# MSVC intermediates
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Runtime / logs
+*.log
+
+# Editor / OS
+.vs/
+*.user
+Thumbs.db
+desktop.ini

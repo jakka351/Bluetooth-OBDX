@@ -1,4 +1,6 @@
-# Bluetooth OBDX 
+<img width="25%" height="25%" align="right" alt="image" src="https://github.com/user-attachments/assets/6fa1ccab-6974-4186-9e89-b52530085d47" />
+
+# Bluetooth OBDX J2534
 
 Proof-of-concept **SAE J2534-1 (v04.04) PassThru shim** that enumerates as a
 normal J2534 device in 32-bit diagnostic software, but routes all

@@ -22,10 +22,10 @@ Set-ItemProperty -Path $key -Name "Vendor"          -Value "Tester Present Speci
 Set-ItemProperty -Path $key -Name "FunctionLibrary" -Value $dll
 Set-ItemProperty -Path $key -Name "ConfigApplication" -Value ""
 
-# Protocol support flags (OBDX Pro FT: CAN/ISO15765 incl. pin-select MS-CAN,
-# J1850 VPW; no K-line, no PWM, no SCI)
-foreach ($p in @{ CAN=1; ISO15765=1; CAN_PS=1; ISO15765_PS=1; J1850VPW=1;
-                  ISO9141=0; ISO14230=0; J1850PWM=0;
+# Protocol support flags (OBDX Pro FT is CAN-only: HS-CAN, MS-CAN via
+# pin-select, ISO15765; no K-line, no VPW, no PWM, no SCI)
+foreach ($p in @{ CAN=1; ISO15765=1; CAN_PS=1; ISO15765_PS=1;
+                  J1850VPW=0; ISO9141=0; ISO14230=0; J1850PWM=0;
                   SCI_A_ENGINE=0; SCI_A_TRANS=0; SCI_B_ENGINE=0; SCI_B_TRANS=0 }.GetEnumerator()) {
     New-ItemProperty -Path $key -Name $p.Key -Value $p.Value -PropertyType DWord -Force | Out-Null
 }
